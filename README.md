@@ -4,7 +4,7 @@ This is an Extension for Forge [Classic](https://github.com/Haoming02/sd-webui-f
 > [!IMPORTANT]
 > Supports **SD1**, **SDXL**, **Anima**, and **Krea 2** on Forge Neo.
 > **Krea 2** is supported in **txt2img**, **img2img**, as well as **Edit** *(reference)* mode.
-> **Krea 2** needs a Forge Neo from 2026-09-30 or later, after its text engines were rewritten.
+> **Anima** and **Krea 2** need a Forge Neo from 2026-10-01 or later, after its text engines were rewritten.
 
 ## How to Use
 
