@@ -4,6 +4,7 @@ This is an Extension for Forge [Classic](https://github.com/Haoming02/sd-webui-f
 > [!IMPORTANT]
 > Supports **SD1**, **SDXL**, **Anima**, **Krea 2**, and **MOSS-Image** on Forge Neo.
 > **Krea 2** is supported in **txt2img**, **img2img**, as well as **Edit** *(reference)* mode.
+> **Krea 2** needs a Forge Neo from 2026-09-30 or later, after its text engines were rewritten.
 > **MOSS-Image** is supported through Forge Neo's own support, as well as the [moss-image-forge-neo](https://github.com/eduardoabreu81/moss-image-forge-neo) Extension.
 
 ## How to Use
@@ -12,7 +13,7 @@ This is an Extension for Forge [Classic](https://github.com/Haoming02/sd-webui-f
 - add `(bar:-1.0)` in the `negative prompt` to **enforce** a concept
 
 > [!NOTE]
-> **Krea 2** normally drops every prompt weight as soon as a reference image is attached. While this Extension is active, the weights of an **Edit** prompt are honored again, meaning that regular emphasis *(eg. `(foo:1.5)`)* takes effect as well.
+> **Krea 2** normally reads prompt weights as literal text, so `(foo:-1.0)` would spell out the very concept it was meant to remove. While this Extension is active, the weights are honored, in **Edit** mode too, meaning that regular emphasis *(eg. `(foo:1.5)`)* takes effect as well.
 
 > [!TIP]
 > On **Krea 2** the weight is a dial, not a switch. A single-stream transformer also attends over the reference and image streams, so one text token carries far less of the attention than it does in **SD**, and `-1.0` can be too subtle to see. Turn it up *(eg. `(foo:-3.0)`)* until the concept goes.

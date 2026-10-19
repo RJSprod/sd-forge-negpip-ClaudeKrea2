@@ -1,5 +1,4 @@
 import re
-import sys
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -31,8 +30,8 @@ def is_krea2(model) -> bool:
 
     A rename or a repackaged build would otherwise drop straight through to
     doing nothing at all, which is indistinguishable from the Extension not
-    being installed.  `KREA2_TAP_LAYERS` is specific to its text engine, where
-    `text_processing_engine_qwen` on its own would also match Qwen-Image.
+    being installed.  The module of its text engine is specific to it, where
+    `text_processing_engine_qwen` on its own is shared by half a dozen models.
     """
 
     if type(model).__name__.lower() in ("krea2", "krea_2"):
@@ -42,8 +41,7 @@ def is_krea2(model) -> bool:
     if engine is None:
         return False
 
-    module = sys.modules.get(type(engine).__module__, None)
-    return getattr(module, "KREA2_TAP_LAYERS", None) is not None
+    return type(engine).__module__.rpartition(".")[2] == "krea2_engine"
 
 
 def reset_prompt_cache(p: "StableDiffusionProcessing"):
