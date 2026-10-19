@@ -3,32 +3,34 @@
 Krea 2 encodes the prompt with Qwen3-VL, then concatenates the resulting text
 tokens with the reference and image streams inside a single transformer.
 
-Where CLIP and T5 weight the *output* of the text encoder, this engine weights
-the *input* embeddings instead, so a negative weight never scales the
-representation of a word: it hands the language model a negated embedding,
-which stands for no word at all.  Sign flipping that output cannot recover the
-concept, which is why negative weights read as doing nothing here however they
-were masked afterwards.  The word is therefore encoded at its magnitude, so
-the conditioning stays a faithful representation of it, and the sign is
-carried separately as a mask that negates the value projection of those tokens
-in every single-stream block.  Attention still routes to the concept, and the
-image stream subtracts it instead of adding it, which is what NegPiP is.  The
-SD implementation has the same shape: it encodes the negated concept with a
-positive weight for exactly this reason.
+Where CLIP and T5 weight the *output* of the text encoder, the emphasis here
+weights the *input* embeddings instead, as Forge Neo's own engine used to, so
+a negative weight never scales the representation of a word: it hands the
+language model a negated embedding, which stands for no word at all.  Sign
+flipping that output cannot recover the concept, which is why negative weights
+read as doing nothing here however they were masked afterwards.  The word is
+therefore encoded at its magnitude, so the conditioning stays a faithful
+representation of it, and the sign is carried separately as a mask that
+negates the value projection of those tokens in every single-stream block.
+Attention still routes to the concept, and the image stream subtracts it
+instead of adding it, which is what NegPiP is.  The SD implementation has the
+same shape: it encodes the negated concept with a positive weight for exactly
+this reason.
 
-The text engine turns emphasis off entirely as soon as a reference image is
-attached, since the vision tower expands one token into many embeddings and the
-weights no longer line up.  The engine hooks below keep the emphasis alive for
-that path and expand the weights over the inserted embeddings instead.
-
-The engine also wraps every emphasis region in its own copy of the chat
-template, which is invisible at weight 1.0 but hands a weighted region some
-thirty tokens of system prompt and chat scaffolding.  Negating those instead of
-the words of the prompt is what made a negative weight read as a no-op, so the
-template is emitted only once here.
+The text engine, a port of ComfyUI's since Forge Neo rewrote them all, does
+not weight the prompt at all.  It tokenizes the templated prompt with weights
+disabled, so `(foo:-1.0)` reaches the language model as literal characters,
+which spell out the very concept that was meant to be removed.  Nor can the
+weighting of the encoder it wraps be borrowed: that indexes the output by
+token on the axis where Krea 2, tapping twelve layers at once, keeps the
+layers.  The hooks below parse the weights themselves and tokenize every
+region on its own, between a single copy of the chat template, so the weight
+lands on the words alone.  The emphasis is applied to the input embeddings
+once the vision tower has expanded every reference image into the embeddings
+it stands for, and the engine is left to encode, strip the template and
+reshape exactly as it would.
 """
 
-import sys
 from functools import wraps
 from typing import TYPE_CHECKING, Callable, Optional
 
@@ -41,24 +43,34 @@ from backend.args import dynamic_args
 from backend.sampling import condition, sampling_function
 from modules import shared
 
-ENGINE_METHODS: tuple[str, ...] = ("__call__", "tokenize_line", "process_embeds")
-ENGINE_REQUIREMENTS: tuple[str, ...] = ("process_tokens", "strip_template", "tokenizer")
+ENGINE_METHODS: tuple[str, ...] = ("__call__", "_tokenize_with_weights")
+ENGINE_REQUIREMENTS: tuple[str, ...] = (
+    "_tokenize_with_weights",
+    "text_encoder.process_tokens",
+    "tokenizer.tokenizer",
+)
+
+IMAGE_PAD: int = 151655
+"""`<|image_pad|>`, which the engine swaps for the image it stands for"""
 
 
 class _EngineState:
-    """Carries the per-chunk data between the patched text engine methods."""
+    """Carries the per-prompt data between the patched text engine methods."""
 
     engine_cls: type = None
     """the patched text engine class"""
 
-    module = None
-    """the module the text engine lives in"""
+    encoder = None
+    """the text encoder whose `process_tokens` is hooked"""
 
-    multipliers: list[float] = None
-    """emphasis weights of the chunk currently being encoded"""
+    emphasis = None
+    """emphasis of the engine call in progress, as configured by the user"""
 
-    aligned: list[float] = None
-    """^ the same weights, expanded over the embeddings of every image"""
+    pending: tuple[str, list[float]] = None
+    """the prompt being encoded, and the weights of its tokens"""
+
+    aligned: dict[str, list[float]] = None
+    """^ the same weights per prompt, expanded over the embeddings of every image"""
 
     masks: list[torch.Tensor] = None
     """sign masks of the last engine call, one per prompt"""
@@ -73,7 +85,8 @@ class _EngineState:
     """whether this generation has confirmed the mask reaching attention"""
 
     def reset(self):
-        self.multipliers = None
+        self.emphasis = None
+        self.pending = None
         self.aligned = None
         self.masks = None
         self.hooked = set()
@@ -164,134 +177,118 @@ def _find_text_engine(model):
 
 
 def _hook_engine(engine, remove: bool):
-    """Patch the text engine class, as `__call__` bypasses the instance."""
+    """Patch the text engine class, as `__call__` bypasses the instance.
+
+    The encoder it wraps is hooked on the instance instead, since its class
+    also serves the text engine of every other model.
+    """
 
     if remove:
         for name, original in _originals.items():
             if getattr(_state.engine_cls, name, None) is not None:
                 setattr(_state.engine_cls, name, original)
         _originals.clear()
+        if _state.encoder is not None:
+            _hook_process_tokens(_state.encoder, True)
         _state.engine_cls = None
-        _state.module = None
+        _state.encoder = None
         return
 
     engine_cls = type(engine)
-    module = sys.modules.get(engine_cls.__module__, None)
 
-    for attr in ENGINE_REQUIREMENTS:
-        if not callable(getattr(engine, attr, None)):
-            raise RuntimeError(f"NegPiP could not find Krea 2's {attr}")
-    if getattr(module, "PromptChunk", None) is None:
-        raise RuntimeError("NegPiP could not find Krea 2's PromptChunk")
-    if not getattr(module, "KREA2_TAP_LAYERS", None):
-        raise RuntimeError("NegPiP could not find Krea 2's hidden layers")
+    for path in ENGINE_REQUIREMENTS:
+        found = engine
+        for attr in path.split("."):
+            found = getattr(found, attr, None)
+        if not callable(found):
+            raise RuntimeError(f"NegPiP could not find Krea 2's {path}")
     # the prompt is templated by hand below, so the slot has to be there
     if "{}" not in getattr(engine, "llama_template", ""):
         raise RuntimeError("NegPiP could not find Krea 2's prompt template")
 
     _state.engine_cls = engine_cls
-    _state.module = module
 
     replacements = {
         "__call__": _negpip_call,
-        "tokenize_line": _negpip_tokenize_line,
-        "process_embeds": _negpip_process_embeds,
+        "_tokenize_with_weights": _negpip_tokenize_with_weights,
     }
 
     for name in ENGINE_METHODS:
         _originals[name] = getattr(engine_cls, name)
         setattr(engine_cls, name, replacements[name])
 
+    _state.encoder = engine.text_encoder
+    _hook_process_tokens(engine.text_encoder, False)
+
 
 def _negpip_call(self, texts: list[str], images: list[torch.Tensor] = []):
-    """Encode every prompt, keeping the emphasis weights of the image path."""
+    """Encode every prompt as the engine does, keeping its emphasis weights."""
 
     from backend.text_processing import emphasis
 
-    self.emphasis = emphasis.get_current_option(shared.opts.emphasis)()
-
+    option = emphasis.get_current_option(shared.opts.emphasis)()
     emphasized = any(emphasis.uses_emphasis(x) for x in texts)
-    if emphasized:
-        dynamic_args.last_extra_generation_params["Emphasis"] = self.emphasis.name
 
     # "None" reads a weight as literal characters, so there is no region to
-    # negate.  Every other mode parses them, and the sign is all NegPiP needs:
-    # the magnitude only decides how strongly the concept is emphasized first.
-    signed = not isinstance(self.emphasis, emphasis.EmphasisNone)
-    if emphasized and not signed:
-        print(f'NegPiP Disabled (Emphasis: "{self.emphasis.name}")')
+    # negate, and the engine is left to encode the prompt exactly as it would.
+    # Every other mode parses them, and the sign is all NegPiP needs: the
+    # magnitude only decides how strongly the concept is emphasized first.
+    if isinstance(option, emphasis.EmphasisNone):
+        if emphasized:
+            print(f'NegPiP Disabled (Emphasis: "{option.name}")')
+        zs = _originals["__call__"](self, texts, images)
+        _state.masks = [_sign_mask(None, z) for z in zs]
+        return zs
 
-    zs: list[torch.Tensor] = []
+    _state.emphasis = option
+    _state.aligned = {}
+    try:
+        zs = _originals["__call__"](self, texts, images)
+        aligned = _state.aligned
+    finally:
+        _state.emphasis = None
+        _state.pending = None
+        _state.aligned = None
+
+    # the engine records "None", which is how it would have read them itself
+    if emphasized:
+        dynamic_args.last_extra_generation_params["Emphasis"] = option.name
+
     masks: list[torch.Tensor] = []
-    cache: dict[str, tuple[list[torch.Tensor], list[torch.Tensor]]] = {}
-
-    for line in texts:
-        if line not in cache:
-            cache[line] = _encode_line(self, line, images, signed)
-
-        line_zs, line_masks = cache[line]
-        zs.extend(line_zs)
-        masks.extend(line_masks)
+    for line, z in zip(texts, zs):
+        weights = aligned.get(line, None)
+        # a silent no-op is the very failure this module exists to avoid
+        if weights is None:
+            raise RuntimeError("NegPiP could not align Krea 2's emphasis weights")
+        masks.append(_sign_mask(weights, z))
 
     _state.masks = masks
     return zs
 
 
-def _encode_line(engine, line: str, images: list[torch.Tensor], signed: bool):
-    layers = len(_state.module.KREA2_TAP_LAYERS)
+def _negpip_tokenize_with_weights(self, text: str, images: list[torch.Tensor] = []):
+    """Tokenize the prompt as one templated conversation, keeping its weights.
 
-    zs: list[torch.Tensor] = []
-    masks: list[torch.Tensor] = []
-
-    for chunk in engine.tokenize_line(line, images):
-        tokens = chunk.tokens
-        multipliers = list(chunk.multipliers)
-
-        # the weights are expanded, and stripped of their sign, in place by
-        # `_negpip_process_embeds`, so that the engine applies them to the
-        # embeddings of the image path too
-        _state.multipliers = multipliers
-        _state.aligned = None
-        try:
-            z = engine.process_tokens([tokens], [multipliers])
-            aligned = _state.aligned
-        finally:
-            _state.multipliers = None
-            _state.aligned = None
-
-        # a silent no-op is the very failure this module exists to avoid
-        if signed and aligned is None:
-            raise RuntimeError("NegPiP could not align Krea 2's emphasis weights")
-
-        z = engine.strip_template(z, tokens)
-        b, seq, fuse = z.shape
-        z = z.reshape(b * seq, layers, fuse // layers)
-
-        zs.append(z)
-        masks.append(_sign_mask(aligned if signed else None, z))
-
-    return zs, masks
-
-
-def _negpip_tokenize_line(self, line: str, images: list[torch.Tensor] = []):
-    """Tokenize the prompt as one templated conversation.
-
-    Upstream templates every emphasis region on its own, so `(foo:-1.0)` is
-    encoded as a second conversation whose system prompt, chat markers and
-    reference image all inherit the weight of the region.  Only a single token
-    of those thirty odd is the concept that was meant to be removed, which
-    leaves the mask below negating mostly scaffolding.  Emitting the template
-    once keeps the prompt well formed and puts the weight on the words alone.
+    Upstream tokenizes the templated prompt as a whole, with weights disabled.
+    Each region is tokenized on its own here instead, between a single copy of
+    the template, which keeps the prompt well formed and puts the weight on
+    the words alone.  The encoder is handed a weight of 1.0 throughout, since
+    it would apply anything else across the layers rather than the tokens, and
+    the weights themselves are kept for `process_tokens` to apply.
     """
+
+    if _state.emphasis is None:
+        # not called by NegPiP's engine call, so there is nothing to keep
+        return _originals["_tokenize_with_weights"](self, text, images)
 
     from backend.text_processing import parsing
 
     regions: list[list] = [
-        [text, weight]
-        for text, weight in parsing.parse_prompt_attention(line, self.emphasis.name)
+        [region, weight]
+        for region, weight in parsing.parse_prompt_attention(text, _state.emphasis.name)
         # a chunking hint for CLIP, which parses to a weight of -1 and would
         # otherwise be negated as if it were part of the prompt
-        if text != "BREAK"
+        if region != "BREAK"
     ]
     if not regions:
         regions = [["", 1.0]]
@@ -304,15 +301,16 @@ def _negpip_tokenize_line(self, line: str, images: list[torch.Tensor] = []):
     if images:
         prefix += self.vision_block * len(images)
 
-    texts = [prefix, *(text for text, _ in regions), suffix]
+    texts = [prefix, *(region for region, _ in regions), suffix]
     weights = [1.0, *(weight for _, weight in regions), 1.0]
 
-    chunk = _state.module.PromptChunk()
+    pairs: list[tuple] = []
+    multipliers: list[float] = []
     embed_count = 0
 
-    for tokens, weight in zip(self.tokenizer(texts)["input_ids"], weights):
+    for tokens, weight in zip(self.tokenizer.tokenizer(texts)["input_ids"], weights):
         for token in tokens:
-            if token == self.id_image:
+            if token == IMAGE_PAD and embed_count < len(images):
                 token = {
                     "type": "image",
                     "data": images[embed_count],
@@ -320,34 +318,62 @@ def _negpip_tokenize_line(self, line: str, images: list[torch.Tensor] = []):
                 }
                 embed_count += 1
 
-            chunk.tokens.append(token)
-            chunk.multipliers.append(weight)
+            pairs.append((token, 1.0))
+            multipliers.append(weight)
 
-    return [chunk]
+    _state.pending = (text, multipliers)
+    return [pairs]
 
 
-def _negpip_process_embeds(self, batch_tokens):
-    result = _originals["process_embeds"](self, batch_tokens)
+def _hook_process_tokens(encoder, remove: bool):
+    """Weight the input embeddings, once every image has been expanded."""
 
-    multipliers = _state.multipliers
-    if multipliers is not None and len(batch_tokens) == 1:
+    if remove:
+        original = getattr(encoder, "negpip_orig_process_tokens", None)
+        if original is not None:
+            if getattr(encoder.process_tokens, "_negpip_krea2", False):
+                encoder.process_tokens = original
+            del encoder.negpip_orig_process_tokens
+        return
+
+    original = encoder.process_tokens
+    encoder.negpip_orig_process_tokens = original
+
+    @wraps(original)
+    def process_tokens(tokens, device):
+        result = original(tokens, device)
+
+        pending, _state.pending = _state.pending, None
+        if pending is None or len(tokens) != 1:
+            return result
         if not isinstance(result, tuple) or len(result) != 4:
             raise RuntimeError("Unexpected Krea 2 embeddings")
 
-        embeds, _, _, embeds_info = result
+        line, multipliers = pending
+        embeds, attention_mask, num_tokens, embeds_info = result
         aligned = _align_multipliers(
-            batch_tokens[0], multipliers, embeds_info, embeds.shape[1]
+            tokens[0], multipliers, embeds_info, embeds.shape[1]
         )
-        if aligned is not None:
-            _state.aligned = aligned
-            # the engine only applies the emphasis when the weights match the
-            # embeddings, which is exactly what the expansion above achieves.
-            # It is handed the magnitudes: scaling an input embedding by a
-            # negative weight encodes as no word at all, so the sign is left
-            # to the mask and applied to the value projection instead
-            multipliers[:] = [abs(weight) for weight in aligned]
+        if aligned is None:
+            return result
+        _state.aligned[line] = aligned
 
-    return result
+        # the emphasis is handed the magnitudes: scaling an input embedding by
+        # a negative weight encodes as no word at all, so the sign is left to
+        # the mask and applied to the value projection instead
+        magnitudes = torch.tensor(
+            [[abs(weight) for weight in aligned]],
+            device=embeds.device,
+            dtype=embeds.dtype,
+        )
+        weighted = _state.emphasis(embeds, magnitudes)
+        if weighted is not None:  # "Ignore" leaves them as they are
+            embeds = weighted
+
+        return embeds, attention_mask, num_tokens, embeds_info
+
+    process_tokens._negpip_krea2 = True
+    encoder.process_tokens = process_tokens
 
 
 def _align_multipliers(
