@@ -4,7 +4,7 @@ This is an Extension for Forge [Classic](https://github.com/Haoming02/sd-webui-f
 > [!IMPORTANT]
 > Supports **SD1**, **SDXL**, **Anima**, **Krea 2**, and **MOSS-Image** on Forge Neo.
 > **Krea 2** is supported in **txt2img**, **img2img**, as well as **Edit** *(reference)* mode.
-> **Krea 2** needs a Forge Neo from 2026-09-30 or later, after its text engines were rewritten.
+> **Anima** and **Krea 2** need a Forge Neo from 2026-10-01 or later, after its text engines were rewritten.
 > **MOSS-Image** is supported through Forge Neo's own support, as well as the [moss-image-forge-neo](https://github.com/eduardoabreu81/moss-image-forge-neo) Extension.
 
 ## How to Use
