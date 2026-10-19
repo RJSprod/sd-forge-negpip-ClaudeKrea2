@@ -8,6 +8,46 @@ from . import IS_NEO
 
 NEG_PATTERN = re.compile(r"\(\s*(?:[^\\(:)]|\\[\(\)])+?\s*\:\s*-\s*\d*\.?\d+\s*\)")
 
+KREA2_GUIDANCE: str = "Attention guidance"
+"""steer the image away from the negated words, as NAG does"""
+
+KREA2_FLIP: str = "Value flip"
+"""negate the attention values of the negated words, as NegPiP does on SD"""
+
+KREA2_METHODS: tuple[str, ...] = (KREA2_GUIDANCE, KREA2_FLIP)
+
+KREA2_DEFAULTS: dict[str, object] = {
+    "negpip_krea2_method": KREA2_GUIDANCE,
+    "negpip_krea2_nag_tau": 2.5,
+    "negpip_krea2_nag_alpha": 0.25,
+}
+
+
+def krea2_settings() -> tuple[str, float, float]:
+    """The Krea 2 method and its guidance parameters, as configured.
+
+    Read through the defaults, so that the Extension runs before its settings
+    were registered, or on a Forge that does not have them.
+    """
+
+    from modules import shared
+
+    opts = getattr(shared, "opts", None)
+
+    def read(key: str):
+        value = getattr(opts, key, None)
+        return KREA2_DEFAULTS[key] if value is None else value
+
+    method = read("negpip_krea2_method")
+    if method not in KREA2_METHODS:
+        method = KREA2_DEFAULTS["negpip_krea2_method"]
+
+    return (
+        method,
+        float(read("negpip_krea2_nag_tau")),
+        float(read("negpip_krea2_nag_alpha")),
+    )
+
 
 def is_krea2(model) -> bool:
     """Whether this is Krea 2, without insisting on the name of its class.

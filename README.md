@@ -15,10 +15,19 @@ This is an Extension for Forge [Classic](https://github.com/Haoming02/sd-webui-f
 > **Krea 2** normally reads prompt weights as literal text, so `(foo:-1.0)` would spell out the very concept it was meant to remove. While this Extension is active, the weights are honored, in **Edit** mode too, meaning that regular emphasis *(eg. `(foo:1.5)`)* takes effect as well.
 
 > [!TIP]
-> On **Krea 2** the weight is a dial, not a switch. A single-stream transformer also attends over the reference and image streams, so one text token carries far less of the attention than it does in **SD**, and `-1.0` can be too subtle to see. Turn it up *(eg. `(foo:-3.0)`)* until the concept goes.
+> **Krea 2** does not work with the `None` **Emphasis Mode**, which reads a weight as literal characters rather than parsing it. The console says so when that happens; every other mode is fine.
+
+## Krea 2
+
+**Krea 2** is a single-stream transformer run at CFG 1: there is no negative prompt to speak of, and a text token is a tiny share of an attention that also covers the reference and image streams. NegPiP reaches it by one of two methods, chosen under **Settings → NegPiP**:
+
+- **Attention guidance** *(default)*: [Normalized Attention Guidance](https://arxiv.org/abs/2505.21179), the method that restores negative prompting on few-step models. The prompt is encoded without the negated words, the words alone are encoded beside the same reference images, and in every block the image is steered away from them. This is the method that works in **Edit** mode, where the concept to remove is in the reference image itself. It costs one extra attention per block, roughly a third more time per step.
+- **Value flip**: what NegPiP does on **SD**, and what every other Krea 2 NegPiP does: the attention values of the negated words are negated, so the image subtracts the concept instead of adding it. Cheaper, and enough for a concept the prompt itself would have drawn; it cannot remove one a reference image shows.
+
+The weight is the dial for both. Under attention guidance `-1.0` is NAG's default guidance scale of 5, and every further `-1.0` adds 4, so `(foo:-2.0)` pushes harder than `(foo:-1.0)`. The normalization threshold *(`tau`, 2.5)* and the blend *(`alpha`, 0.25)* are NAG's defaults and sit in the same settings: raise them for stronger guidance, lower them to keep a reference image more faithfully. Several negated regions are joined into one negative phrase, at the strongest of their weights. The method and its parameters are written to the infotext.
 
 > [!TIP]
-> **Krea 2** does not work with the `None` **Emphasis Mode**, which reads a weight as literal characters rather than parsing it. The console says so when that happens; every other mode is fine.
+> In **Edit** mode, say what should be there instead: `a person in a red shirt, (green shirt:-1.0)` gives the guidance somewhere to go, where `a person in a (green shirt:-1.0)` only takes the words away.
 
 ## Console
 
@@ -27,9 +36,9 @@ The Extension reports what it did, so that nothing it decided is silent:
 | | |
 | --- | --- |
 | `NegPiP Loaded` | it is installed and being called, listing the models it can handle |
-| `NegPiP Active` | it engaged, naming the model it recognised |
+| `NegPiP Active` | it engaged, naming the model it recognised and, on Krea 2, the method |
 | `NegPiP Enable` | how many tokens it is negating |
-| `NegPiP Applied` | *(Krea 2)* the negation reached the transformer |
+| `NegPiP Applied` | *(Krea 2)* the method reached the transformer, with its scale and token counts |
 | `NegPiP Disabled` | it stood down, and why |
 
 Nothing at all for a prompt that does contain `(foo:-1.0)` means the weight was not recognised as one.

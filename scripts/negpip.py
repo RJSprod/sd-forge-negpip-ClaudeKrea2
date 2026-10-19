@@ -64,18 +64,22 @@ IS_NEO: bool = _library.IS_NEO
 INCOMPATIBLE_EXTENSIONS: set[str] = _library.INCOMPATIBLE_EXTENSIONS
 
 NEG_PATTERN = _utils.NEG_PATTERN
+KREA2_DEFAULTS = _utils.KREA2_DEFAULTS
+KREA2_GUIDANCE = _utils.KREA2_GUIDANCE
+KREA2_METHODS = _utils.KREA2_METHODS
 any_negative = _utils.any_negative
 hr_dealer = _utils.hr_dealer
 is_krea2 = _utils.is_krea2
+krea2_settings = _utils.krea2_settings
 reset_prompt_cache = _utils.reset_prompt_cache
 
-from modules import scripts
+from modules import scripts, shared
 from modules.prompt_parser import (
     SdConditioning,
     get_learned_conditioning,
     get_learned_conditioning_prompt_schedules,
 )
-from modules.script_callbacks import CFGDenoiserParams, on_cfg_denoiser
+from modules.script_callbacks import CFGDenoiserParams, on_cfg_denoiser, on_ui_settings
 
 
 def _support(module: str, function: str) -> Optional[Callable]:
@@ -105,6 +109,61 @@ SUPPORTED: dict[str, Optional[Callable]] = {
     "Anima": patch_anima_negpip,
     "Krea 2": patch_krea2_negpip,
 }
+
+
+def _ui_settings():
+    """The Krea 2 method and its parameters, under their own settings section.
+
+    `-1.0` is a guidance scale of 5, NAG's default; the weight is the dial.
+    """
+
+    import gradio as gr
+
+    section = ("negpip", "NegPiP")
+    shared.opts.add_option(
+        "negpip_krea2_method",
+        shared.OptionInfo(
+            KREA2_DEFAULTS["negpip_krea2_method"],
+            "[Krea 2] Method",
+            gr.Radio,
+            {"choices": list(KREA2_METHODS)},
+            section=section,
+            infotext="NegPiP Method",
+        ).info(
+            "attention guidance steers the image away from the negated words, "
+            "and works beside a reference image; value flip negates their "
+            "attention values, as NegPiP does on SD"
+        ),
+    )
+    shared.opts.add_option(
+        "negpip_krea2_nag_tau",
+        shared.OptionInfo(
+            KREA2_DEFAULTS["negpip_krea2_nag_tau"],
+            "[Krea 2] Attention guidance: normalization threshold (tau)",
+            gr.Slider,
+            {"minimum": 1.0, "maximum": 10.0, "step": 0.1},
+            section=section,
+            infotext="NegPiP NAG tau",
+        ).info(
+            "higher is stronger guidance; lower keeps a reference image more faithfully"
+        ),
+    )
+    shared.opts.add_option(
+        "negpip_krea2_nag_alpha",
+        shared.OptionInfo(
+            KREA2_DEFAULTS["negpip_krea2_nag_alpha"],
+            "[Krea 2] Attention guidance: blend (alpha)",
+            gr.Slider,
+            {"minimum": 0.0, "maximum": 1.0, "step": 0.01},
+            section=section,
+            infotext="NegPiP NAG alpha",
+        ).info(
+            "how much of the guided attention replaces the original; higher is stronger"
+        ),
+    )
+
+
+on_ui_settings(_ui_settings)
 
 
 def _verify_ext(p: " StableDiffusionProcessing"):
@@ -224,6 +283,12 @@ class NegPiP(scripts.Script):
                     print("NegPiP Disabled (Krea 2 support failed to import)")
                     return
                 patch_krea2_negpip(NegPiP, p.sd_model)
+                method, tau, alpha = krea2_settings()
+                model_name = f"{model_name}: {method}"
+                p.extra_generation_params["NegPiP Method"] = method
+                if method == KREA2_GUIDANCE:
+                    p.extra_generation_params["NegPiP NAG tau"] = tau
+                    p.extra_generation_params["NegPiP NAG alpha"] = alpha
             else:
                 # the prompt asked for NegPiP, so say why it is not happening;
                 # returning quietly reads as the Extension not being installed
