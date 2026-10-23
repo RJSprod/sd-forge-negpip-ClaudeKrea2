@@ -65,11 +65,13 @@ INCOMPATIBLE_EXTENSIONS: set[str] = _library.INCOMPATIBLE_EXTENSIONS
 
 NEG_PATTERN = _utils.NEG_PATTERN
 any_negative = _utils.any_negative
+any_weight = _utils.any_weight
 hr_dealer = _utils.hr_dealer
 is_krea2 = _utils.is_krea2
+is_moss = _utils.is_moss
 reset_prompt_cache = _utils.reset_prompt_cache
 
-from modules import scripts
+from modules import scripts, shared
 from modules.prompt_parser import (
     SdConditioning,
     get_learned_conditioning,
@@ -83,7 +85,7 @@ def _support(module: str, function: str) -> Optional[Callable]:
 
     Importing these at the top of the file means a single missing or
     incompatible module raises out of the Extension, and Forge then skips it
-    entirely: SD, Anima and Krea 2 all go down together over any one of them,
+    entirely: every model family goes down together over any one of them,
     and the only sign is a traceback at startup that scrolls away.  A family
     that cannot be imported is disabled on its own instead, and says so at the
     point where it was actually wanted.
@@ -98,12 +100,18 @@ def _support(module: str, function: str) -> Optional[Callable]:
 
 patch_anima_negpip = _support("anima", "patch_anima_negpip")
 patch_krea2_negpip = _support("krea2", "patch_krea2_negpip")
+patch_moss_negpip = _support("moss", "patch_moss_negpip")
 patch_sd_negpip = _support("sd", "patch_sd_negpip")
+
+moss_has_weights: Optional[Callable] = (
+    None if patch_moss_negpip is None else _support("moss", "has_weights")
+)
 
 SUPPORTED: dict[str, Optional[Callable]] = {
     "SD": patch_sd_negpip,
     "Anima": patch_anima_negpip,
     "Krea 2": patch_krea2_negpip,
+    "MOSS-Image": patch_moss_negpip,
 }
 
 
@@ -118,7 +126,7 @@ def _verify_ext(p: " StableDiffusionProcessing"):
 
 
 class NegPiP(scripts.Script):
-    _patched: list[bool] = [False, False, False]
+    _patched: list[bool] = [False, False, False, False]
 
     _announced: bool = False
     """whether this session has confirmed the Extension is being called"""
@@ -129,6 +137,7 @@ class NegPiP(scripts.Script):
         self.is_xl: bool
         self.is_anima: bool
         self.is_krea2: bool
+        self.is_moss: bool
         self.is_hr: bool
 
         self.tokenizer: torch.nn.Module
@@ -158,6 +167,7 @@ class NegPiP(scripts.Script):
         self.is_xl = False
         self.is_anima = False
         self.is_krea2 = False
+        self.is_moss = False
         self.is_hr = False
 
         self.tokenizer = None
@@ -178,6 +188,8 @@ class NegPiP(scripts.Script):
             patch_anima_negpip(NegPiP, unpatch=True)
         if patch_krea2_negpip is not None:
             patch_krea2_negpip(NegPiP, unpatch=True)
+        if patch_moss_negpip is not None:
+            patch_moss_negpip(NegPiP, unpatch=True)
 
     def title(self):
         return "NegPiP"
@@ -201,7 +213,16 @@ class NegPiP(scripts.Script):
                 f"{', '.join(families) if families else 'nothing'})"
             )
 
-        if not any_negative(p):
+        if IS_NEO and is_moss(p.sd_model):
+            # MOSS-Image reads every weight as literal text, so every weight is
+            # this Extension's to read, not only a negative one
+            if moss_has_weights is None:
+                weighted = any_weight(p)
+            else:
+                weighted = moss_has_weights(p)
+            if not weighted:
+                return
+        elif not any_negative(p):
             return
 
         if not _verify_ext(p):
@@ -213,6 +234,7 @@ class NegPiP(scripts.Script):
         if IS_NEO and not p.sd_model.is_webui_legacy_model():
             self.is_anima = model_name == "Anima"
             self.is_krea2 = is_krea2(p.sd_model)
+            self.is_moss = is_moss(p.sd_model)
 
             if self.is_anima:
                 if patch_anima_negpip is None:
@@ -224,6 +246,16 @@ class NegPiP(scripts.Script):
                     print("NegPiP Disabled (Krea 2 support failed to import)")
                     return
                 patch_krea2_negpip(NegPiP, p.sd_model)
+            elif self.is_moss:
+                if patch_moss_negpip is None:
+                    print("NegPiP Disabled (MOSS-Image support failed to import)")
+                    return
+                if shared.opts.emphasis == "None":
+                    # which reads a weight as literal characters, exactly as
+                    # MOSS-Image does without this Extension
+                    print('NegPiP Disabled (Emphasis: "None")')
+                    return
+                patch_moss_negpip(NegPiP, p.sd_model)
             else:
                 # the prompt asked for NegPiP, so say why it is not happening;
                 # returning quietly reads as the Extension not being installed
@@ -297,7 +329,7 @@ class NegPiP(scripts.Script):
         self.is_hr = True
 
     def denoiser_callback(self, params: CFGDenoiserParams):
-        if (not self.active) or self.is_anima or self.is_krea2:
+        if (not self.active) or self.is_anima or self.is_krea2 or self.is_moss:
             return
 
         conds_list = []

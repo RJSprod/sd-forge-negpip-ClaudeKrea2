@@ -8,6 +8,22 @@ if TYPE_CHECKING:
 from . import IS_NEO
 
 NEG_PATTERN = re.compile(r"\(\s*(?:[^\\(:)]|\\[\(\)])+?\s*\:\s*-\s*\d*\.?\d+\s*\)")
+WEIGHT_PATTERN = re.compile(
+    r"\(\s*(?:[^\\(:)]|\\[\(\)])+?\s*\:\s*[+-]?\s*\d*\.?\d+\s*\)"
+)
+
+
+def is_moss(model) -> bool:
+    """Whether this is MOSS-Image, through Forge's own support or the extension.
+
+    Forge's engine is `MOSSImage`.  The moss-image-forge-neo extension, which
+    takes the model over while it is installed, has `MossImageEngine` and flags
+    itself with `is_moss_image`.
+    """
+
+    if type(model).__name__ in ("MOSSImage", "MossImageEngine"):
+        return True
+    return getattr(model, "is_moss_image", False) is True
 
 
 def is_krea2(model) -> bool:
@@ -53,6 +69,22 @@ def has_negative(prompt: str) -> bool:
 
 def have_negative(prompts: list[str]) -> bool:
     return any(has_negative(p) for p in prompts)
+
+
+def any_weight(p: "StableDiffusionProcessing") -> bool:
+    """Whether any prompt carries an explicit `(foo:weight)`, of either sign."""
+
+    return any(
+        re.search(WEIGHT_PATTERN, prompt)
+        for field in (
+            "prompts",
+            "negative_prompts",
+            "hr_prompts",
+            "hr_negative_prompts",
+        )
+        for prompt in (getattr(p, field, None) or ())
+        if isinstance(prompt, str)
+    )
 
 
 def any_negative(p: "StableDiffusionProcessing") -> bool:
