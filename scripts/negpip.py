@@ -103,6 +103,9 @@ patch_krea2_negpip = _support("krea2", "patch_krea2_negpip")
 patch_moss_negpip = _support("moss", "patch_moss_negpip")
 patch_sd_negpip = _support("sd", "patch_sd_negpip")
 
+krea2_has_weights: Optional[Callable] = (
+    None if patch_krea2_negpip is None else _support("krea2", "has_weights")
+)
 moss_has_weights: Optional[Callable] = (
     None if patch_moss_negpip is None else _support("moss", "has_weights")
 )
@@ -220,6 +223,15 @@ class NegPiP(scripts.Script):
                 weighted = any_weight(p)
             else:
                 weighted = moss_has_weights(p)
+            if not weighted:
+                return
+        elif IS_NEO and is_krea2(p.sd_model):
+            # and so does Krea 2: `(foo:1.5)` alone would otherwise reach the
+            # model as those very characters
+            if krea2_has_weights is None:
+                weighted = any_weight(p)
+            else:
+                weighted = krea2_has_weights(p)
             if not weighted:
                 return
         elif not any_negative(p):

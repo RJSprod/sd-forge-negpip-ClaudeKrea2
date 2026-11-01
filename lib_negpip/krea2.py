@@ -35,6 +35,7 @@ from functools import wraps
 from typing import TYPE_CHECKING, Callable, Optional
 
 if TYPE_CHECKING:
+    from modules.processing import StableDiffusionProcessing
     from scripts.negpip import NegPiP
 
 import torch
@@ -42,6 +43,13 @@ import torch
 from backend.args import dynamic_args
 from backend.sampling import condition, sampling_function
 from modules import shared
+
+PROMPT_FIELDS: tuple[str, ...] = (
+    "prompts",
+    "negative_prompts",
+    "hr_prompts",
+    "hr_negative_prompts",
+)
 
 ENGINE_METHODS: tuple[str, ...] = ("__call__", "_tokenize_with_weights")
 ENGINE_REQUIREMENTS: tuple[str, ...] = (
@@ -75,6 +83,9 @@ class _EngineState:
     masks: list[torch.Tensor] = None
     """sign masks of the last engine call, one per prompt"""
 
+    weighted: int = 0
+    """how many tokens of the last engine call a positive weight emphasized"""
+
     dit_cls: type = None
     """the patched transformer class"""
 
@@ -89,6 +100,7 @@ class _EngineState:
         self.pending = None
         self.aligned = None
         self.masks = None
+        self.weighted = 0
         self.hooked = set()
         self.reported = False
 
@@ -151,6 +163,35 @@ def _unhook(model, dit):
     _hook_compile_conditions(True)
     _hook_engine(None, True)
     _state.reset()
+
+
+def has_weights(p: "StableDiffusionProcessing") -> bool:
+    """Whether any prompt of the batch carries a weight for this Extension to read.
+
+    Any weight, not only a negative one: the engine reads them all as literal
+    text, so `(foo:1.5)` left alone would reach the model with its brackets on,
+    asking for `foo` as plainly as ever.  The prompts are scheduled first, as
+    Forge does before the engine sees them, so that `[foo:bar:0.5]` is not
+    mistaken for de-emphasis.  `BREAK` is no weight, whatever the parser marks
+    it with: the engine reads it as a word.
+    """
+
+    from backend.text_processing import parsing
+    from modules.prompt_parser import get_learned_conditioning_prompt_schedules
+
+    steps = max(int(getattr(p, "steps", 1) or 1), 1)
+
+    for field in PROMPT_FIELDS:
+        prompts = [x for x in (getattr(p, field, None) or ()) if isinstance(x, str)]
+        if not prompts:
+            continue
+        for schedule in get_learned_conditioning_prompt_schedules(prompts, steps):
+            for _, text in schedule:
+                for region, weight in parsing.parse_prompt_attention(text):
+                    if region != "BREAK" and weight != 1.0:
+                        return True
+
+    return False
 
 
 def _find_text_engine(model):
@@ -255,14 +296,20 @@ def _negpip_call(self, texts: list[str], images: list[torch.Tensor] = []):
         dynamic_args.last_extra_generation_params["Emphasis"] = option.name
 
     masks: list[torch.Tensor] = []
+    weighted = 0
     for line, z in zip(texts, zs):
         weights = aligned.get(line, None)
         # a silent no-op is the very failure this module exists to avoid
         if weights is None:
             raise RuntimeError("NegPiP could not align Krea 2's emphasis weights")
         masks.append(_sign_mask(weights, z))
+        if not isinstance(option, emphasis.EmphasisIgnore):
+            # the prompt is the tail the template was stripped from, see `_sign_mask`
+            prompt = weights[-z.shape[0] :] if len(weights) >= z.shape[0] else []
+            weighted += sum(1 for w in prompt if w >= 0.0 and w != 1.0)
 
     _state.masks = masks
+    _state.weighted = weighted
     return zs
 
 
@@ -452,9 +499,11 @@ def _hook_get_learned_conditioning(model, remove: bool):
     @wraps(original)
     def get_learned_conditioning(prompt):
         _state.masks = None
+        _state.weighted = 0
         _state.reported = False
         conds = original(prompt)
         masks, _state.masks = _state.masks, None
+        weighted, _state.weighted = _state.weighted, 0
 
         # Krea 2 returns one [tokens, layers, features] tensor per prompt.
         # Keep this deliberately strict: silently losing the mask is worse than
@@ -479,13 +528,15 @@ def _hook_get_learned_conditioning(model, remove: bool):
             contexts.append(cond)
             negpip_masks.append(mask)
 
-        if count:
+        if count or weighted:
             key = (
                 "Negative"
                 if getattr(prompt, "is_negative_prompt", False)
                 else "Positive"
             )
-            print(f"NegPiP Enable ({key}: {count})")
+            counts = [f"{count} negated"] if count else []
+            counts += [f"{weighted} weighted"] if weighted else []
+            print(f"NegPiP Enable ({key}: {', '.join(counts)})")
 
         # lists, so that prompts of different lengths are padded downstream
         return {"crossattn": contexts, "c_negpip_mask": negpip_masks}

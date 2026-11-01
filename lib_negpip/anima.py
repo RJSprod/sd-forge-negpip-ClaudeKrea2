@@ -55,6 +55,15 @@ def _hook_get_learned_conditioning(model: "AnimaEngine", remove: bool):
         assert isinstance(conds, list)
         assert len(prompt) == len(conds)
 
+        # The engine multiplies the conditioning by the weights, sign included,
+        # which the mask undoes so that the keys still route to the concept, and
+        # the cross attention then negates the values alone.  "Ignore" leaves the
+        # conditioning unweighted, so there is no sign to undo: negating it here
+        # as well would negate the keys and leave the values as they were, the
+        # very opposite of NegPiP.  The values are negated either way, which
+        # leaves "Ignore" the sign, as on every other model.
+        signed = engine.emphasis.name != "Ignore"
+
         crossattn = []
         negpip_mask = []
         _count = 0
@@ -75,7 +84,10 @@ def _hook_get_learned_conditioning(model: "AnimaEngine", remove: bool):
 
             _count += int((mask < 0).sum())
 
-            crossattn.append(cond_data * mask.unsqueeze(-1).to(cond_data))
+            if signed:
+                crossattn.append(cond_data * mask.unsqueeze(-1).to(cond_data))
+            else:
+                crossattn.append(cond_data)
             negpip_mask.append(mask.unsqueeze(-1).to(cond_data))
 
         if _count > 0:

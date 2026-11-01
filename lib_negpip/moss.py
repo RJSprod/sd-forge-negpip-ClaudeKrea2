@@ -4,7 +4,11 @@ MOSS-Image reaches Forge Neo two ways: Forge's own support (2026-10-21), and the
 moss-image-forge-neo extension, which takes the model over while it is installed.
 The model is the same either way.  Qwen3.5 encodes the whole chat-templated
 prompt, two text-only refiner blocks read it, and 42 single-stream blocks then
-attend over the image tokens followed by the text tokens.
+attend over the image tokens followed by the text tokens.  Both backends also
+edit: reference images run as a branch of their own, whose keys and values
+every block attends to after the prompt (or, on some of Forge's reference
+methods, as tokens after the prompt), and Forge's `ai-toolkit` method also shows
+the pictures to Qwen3.5, ahead of the prompt.
 
 Neither backend parses prompt weights.  Both hand the prompt to the text encoder
 as typed, so `(foo:-1.0)` and `(foo:0.5)` arrive as those very characters,
@@ -29,11 +33,15 @@ next block normalises away at the expense of detail.  About the mean, only what
 makes the word that word is scaled, so `-1.0` inverts the word without also
 subtracting "there is a prompt here" from the whole image.
 
-The mask reaches the blocks through the override Forge's attention function
-takes in `transformer_options`, which every attention backend honours, so
-nothing inside the blocks is reimplemented and no backend is forced.  The two
-refiners are left alone: they attend over the prompt alone, and the concept has
-to survive them intact for attention to route to it.
+The text engine of each backend is hooked rather than the model's own
+`get_learned_conditioning`, which is what sets up and clears the reference
+images of an edit, and has to keep doing so.  The mask reaches the blocks
+through the override Forge's attention function takes in `transformer_options`,
+which every attention backend honours, so nothing inside the blocks is
+reimplemented and no backend is forced.  The two refiners are left alone: they
+attend over the prompt alone, and the concept has to survive them intact for
+attention to route to it.  So is the reference branch, which never sees the
+prompt.
 """
 
 import json
@@ -48,7 +56,7 @@ if TYPE_CHECKING:
 
 import torch
 
-from backend import attention, memory_management
+from backend import attention
 from backend.args import dynamic_args
 from backend.sampling import condition, sampling_function
 from backend.text_processing import emphasis, parsing
@@ -59,10 +67,16 @@ MASK_KEY: str = "c_negpip_mask"
 OVERRIDE_KEY: str = "optimized_attention_override"
 
 IM_START: str = "<|im_start|>"
-"""a prompt that already is chat markup, which the engine templates nothing around"""
+"""a prompt that already is chat markup, which this Extension leaves alone"""
 
 STRIPPED_LAYOUT = re.compile(r'\s*"(summary|items)"\s*:')
 """a layout whose braces sd-dynamic-prompts stripped, which reads `{x}` as a variant"""
+
+CAPTION: str = '"caption"'
+"""the key of the scene's caption and of every item's, the prose of a layout"""
+
+PLACEHOLDER: int = 0xF0000
+"""private use code points that stand in for JSON escapes while a caption is parsed"""
 
 PROMPT_FIELDS: tuple[str, ...] = (
     "prompts",
@@ -75,17 +89,33 @@ PROMPT_FIELDS: tuple[str, ...] = (
 class _State:
     """Carries what the hooks share between them."""
 
+    backend = None
+    """the backend of the patched model"""
+
+    engine_cls: type = None
+    """the patched text engine class"""
+
     dit_cls: type = None
     """the patched transformer class"""
+
+    masks: Optional[list[torch.Tensor]] = None
+    """the masks of the conditioning being encoded, one per prompt; None otherwise"""
+
+    references: int = 0
+    """how deep the transformer is in its reference branch, which never sees the prompt"""
 
     reported: bool = False
     """whether this generation has confirmed the mask reaching attention"""
 
     def reset(self):
+        self.backend = None
+        self.masks = None
+        self.references = 0
         self.reported = False
 
 
 _state = _State()
+_engine_originals: dict[str, Callable] = {}
 _dit_originals: dict[str, Callable] = {}
 
 
@@ -118,8 +148,10 @@ def patch_moss_negpip(cls: "NegPiP", model=None, *, unpatch: bool = False):
 
     cls._moss_patched_model = model
     try:
-        _hook_get_learned_conditioning(model, backend, False)
-        _hook_dit_forward(dit, False)
+        _state.backend = backend
+        _hook_engine(backend.engine, False)
+        _hook_get_learned_conditioning(model, False)
+        _hook_dit(dit, False)
         _hook_compile_conditions(False)
     except Exception:
         # Each remover tolerates a partially installed hook set.
@@ -130,8 +162,9 @@ def patch_moss_negpip(cls: "NegPiP", model=None, *, unpatch: bool = False):
 
 
 def _unhook(model):
-    _hook_get_learned_conditioning(model, None, True)
-    _hook_dit_forward(None, True)
+    _hook_get_learned_conditioning(model, True)
+    _hook_engine(None, True)
+    _hook_dit(None, True)
     _hook_compile_conditions(True)
     _state.reset()
 
@@ -143,7 +176,7 @@ def has_weights(p: "StableDiffusionProcessing") -> bool:
     text, so one this Extension left alone would reach the model with its
     brackets on.  The prompts are scheduled first, as Forge does before the
     engine sees them, so that `[foo:bar:0.5]` is not mistaken for de-emphasis,
-    and the layout of a layout prompt is data rather than a weight.
+    and the structure of a layout prompt is data rather than a weight.
     """
 
     backend = _backend(p.sd_model)
@@ -192,6 +225,9 @@ class _Native:
 
     max_length: Optional[int] = None
 
+    verbatim: bool = False
+    """whether the engine hands the prompt over as typed; this one unescapes `\\(`"""
+
     def __init__(self, model):
         self.engine = getattr(model, "text_processing_engine_qwen", None)
         self.template = str(getattr(self.engine, "llama_template", ""))
@@ -216,18 +252,42 @@ class _Native:
         # `Qwen359BEngine.__call__` strips the line, and an empty one is a space
         return line.strip() or " "
 
-    unescape = staticmethod(_unescape)
-
     def ids(self, text: str) -> list[int]:
         # the very call `tokenize_with_weights` makes, which adds no special tokens
         return list(self.engine.tokenizer.tokenizer(text)["input_ids"])
 
-    def encode_plain(self, line: str) -> torch.Tensor:
-        return self.engine([line])[0]
+    def head(self, images: list) -> list:
+        """The tokens ahead of the prompt: the template, and the pictures of an edit.
+
+        With pictures, the engine is asked to tokenize an empty prompt, so that
+        however it introduces them, they come out exactly as it does, the image
+        tokens already swapped for the pictures they stand for.
+        """
+
+        prefix, _, suffix = self.template.partition("{}")
+        if not images:
+            return self.ids(prefix)
+
+        tokenize = getattr(self.engine, "_tokenize_with_weights", None)
+        if not callable(tokenize):
+            raise RuntimeError("NegPiP could not find MOSS-Image's reference prompt")
+        chunks = tokenize("", images)
+        tokens = [pair[0] for pair in chunks[0]]
+        tail = self.ids(suffix) if suffix else []
+        if len(chunks) != 1 or tokens[len(tokens) - len(tail) :] != tail:
+            raise RuntimeError("NegPiP could not find MOSS-Image's reference prompt")
+        return tokens[: len(tokens) - len(tail)]
+
+    def encode_plain(self, line: str, images: list) -> torch.Tensor:
+        # the engine's own call, for one line
+        return _engine_originals["__call__"](self.engine, [line], images)[0]
 
 
 class _Extension:
     """The moss-image-forge-neo extension: `MossImageEngine`, with `MossTextEngine`."""
+
+    verbatim: bool = True
+    """whether the engine hands the prompt over as typed; this one does"""
 
     def __init__(self, model):
         self.engine = getattr(model, "text_engine_moss", None)
@@ -265,16 +325,16 @@ class _Extension:
             text = self.restore(text)
         return text
 
-    @staticmethod
-    def unescape(text: str) -> tuple[str, list[int]]:
-        # the extension hands the prompt to the tokenizer as typed
-        return text, list(range(len(text) + 1))
-
     def ids(self, text: str) -> list[int]:
         tokenizer = self.engine.tokenizer.tokenizer
         return list(tokenizer.encode(text, add_special_tokens=False))
 
-    def encode_plain(self, line: str) -> torch.Tensor:
+    def head(self, images: list) -> list:
+        # the extension shows the text encoder no pictures; its edit is the DiT's
+        return self.ids(self.template.partition("{}")[0])
+
+    def encode_plain(self, line: str, images: list) -> torch.Tensor:
+        # what the engine's own call does for each line
         return self.engine.encode(line)
 
 
@@ -289,36 +349,7 @@ def _backend(model):
 
 
 # ================================================================================ #
-# Text Engine
-
-
-def _split_layout(backend, text: str) -> tuple[str, str]:
-    """`(layout, rest)`: the JSON object a layout prompt opens with, and what follows.
-
-    A layout is data, not a prompt with weights in it.  Its `bbox` arrays would
-    read as de-emphasis to the parser, which would strip their brackets, so it
-    is handed to the model exactly as the engine hands it, and only what follows
-    it, such as the JSON Builder's Extra field, is read for weights.  The
-    Builder escapes every parenthesis, and `\\(` is no JSON escape, so the
-    object is looked for in the text the way the engine unescapes it.
-    """
-
-    plain, where = backend.unescape(text)
-    if STRIPPED_LAYOUT.match(plain):
-        # the extension rebuilds the braces, Forge's own engine does not; data
-        # either way, and parsing its arrays as weights would only break it more
-        return plain, ""
-    if not plain.startswith("{"):
-        return "", text
-
-    try:
-        layout, end = json.JSONDecoder().raw_decode(plain)
-    except ValueError:
-        return "", text
-    if not isinstance(layout, dict):
-        return "", text
-
-    return plain[:end], text[where[end] :]
+# Prompt
 
 
 def _segments(text: str) -> list[tuple[str, float]]:
@@ -338,23 +369,188 @@ def _segments(text: str) -> list[tuple[str, float]]:
     return segments
 
 
+def _json_strings(text: str, end: int) -> list[tuple[int, int]]:
+    """`(start, stop)` of every JSON string in `text[:end]`, quotes included."""
+
+    spans = []
+    i = 0
+    while i < end:
+        if text[i] != '"':
+            i += 1
+            continue
+        j = i + 1
+        while j < end and text[j] != '"':
+            j += 2 if text[j] == "\\" else 1
+        spans.append((i, min(j + 1, end)))
+        i = j + 1
+    return spans
+
+
+def _caption_spans(text: str, end: int) -> list[tuple[int, int]]:
+    """`(start, stop)` of the content of every caption, quotes excluded.
+
+    The scene's caption and every item's are what the layout says in words;
+    everything else, the words to render, the meta, the labels and the boxes,
+    is data.
+    """
+
+    strings = _json_strings(text, end)
+    spans = []
+    for (key_start, key_stop), (value_start, value_stop) in zip(strings, strings[1:]):
+        if text[key_start:key_stop] != CAPTION:
+            continue
+        if text[key_stop:value_start].strip() != ":":
+            continue
+        spans.append((value_start + 1, value_stop - 1))
+    return spans
+
+
+def _protect(text: str) -> tuple[str, list[str]]:
+    """The JSON escapes of a caption, swapped for characters the parser leaves alone.
+
+    The parser reads a backslash as its own escape, so `\\"` would lose its
+    backslash, and `\\\\` half of it.  `\\(` and `\\)` stay, as the escapes of
+    Forge that they are: parentheses meant literally.
+    """
+
+    out: list[str] = []
+    table: list[str] = []
+    i = 0
+    while i < len(text):
+        if text[i] == "\\" and text[i + 1 : i + 2] not in ("(", ")", ""):
+            size = 6 if text[i + 1] == "u" else 2
+            out.append(chr(PLACEHOLDER + len(table)))
+            table.append(text[i : i + size])
+            i += size
+        else:
+            out.append(text[i])
+            i += 1
+    return "".join(out), table
+
+
+def _restore(text: str, table: list[str]) -> str:
+    if not table:
+        return text
+    return "".join(
+        (
+            table[ord(c) - PLACEHOLDER]
+            if PLACEHOLDER <= ord(c) < PLACEHOLDER + len(table)
+            else c
+        )
+        for c in text
+    )
+
+
+def _caption(text: str) -> Optional[list[tuple[str, float]]]:
+    """A caption as `(text, weight)` pieces, or `None` when it carries no weight.
+
+    The caption is prose, so it is laid out as a sentence is, except that the
+    whitespace inside its quotes is kept as it is.
+    """
+
+    protected, table = _protect(text)
+    segments = _segments(protected)
+    if all(weight == 1.0 for _, weight in segments):
+        return None
+
+    lead = protected[: len(protected) - len(protected.lstrip())]
+    trail = protected[len(protected.rstrip()) :]
+    pieces = _join(segments)
+    if not pieces:
+        return None
+
+    first, weight = pieces[0]
+    pieces[0] = (lead + first, weight)
+    if trail:
+        pieces.append((trail, 1.0))
+    return [(_restore(piece, table), weight) for piece, weight in pieces]
+
+
+def _split_layout(backend, text: str) -> Optional[tuple[list[tuple[str, float]], str]]:
+    """`(pieces, rest)` of a layout prompt: the JSON object it opens with, and what follows.
+
+    A layout is data, not a prompt with weights in it.  Its `bbox` arrays would
+    read as de-emphasis to the parser, which would strip their brackets, so it
+    is handed to the model as the engine hands it, captions aside: the scene's
+    and every item's are prose, and are read for weights.  Only what follows
+    the layout, such as the JSON Builder's Extra field, is read as a prompt.
+
+    The Builder escapes every parenthesis, and `\\(` is no JSON escape, so the
+    object is looked for in the text the way Forge's engine unescapes it, then
+    cut from the text as the engine hands it over.  `None` when the line does
+    not open with a layout.
+    """
+
+    plain, where = _unescape(text)
+
+    def cut(start: int, stop: int) -> str:
+        return text[where[start] : where[stop]] if backend.verbatim else plain[start:stop]
+
+    if STRIPPED_LAYOUT.match(plain):
+        # the extension rebuilds the braces, Forge's own engine does not; data
+        # either way, and parsing its arrays as weights would only break it more
+        return [(cut(0, len(plain)), 1.0)], ""
+    if not plain.startswith("{"):
+        return None
+
+    try:
+        layout, end = json.JSONDecoder().raw_decode(plain)
+    except ValueError:
+        return None
+    if not isinstance(layout, dict):
+        return None
+
+    pieces: list[tuple[str, float]] = []
+    done = 0
+    for start, stop in _caption_spans(plain, end):
+        # read in the text as typed, where `\\(` still means a literal parenthesis
+        caption = _caption(text[where[start] : where[stop]])
+        if caption is None:
+            continue
+        pieces.append((cut(done, start), 1.0))
+        pieces.extend(caption)
+        done = stop
+    pieces.append((cut(done, end), 1.0))
+
+    return pieces, text[where[end] :]
+
+
 def _parse(backend, line: str) -> Optional[list[tuple[str, float]]]:
     """The line as `(text, weight)` pieces, or `None` when it carries no weight.
 
-    A line without a weight is left to the engine whole, so that it encodes
-    exactly as it does without this Extension.
+    The pieces are laid out as the one sentence they make, see `_join`.  A line
+    without a weight is left to the engine whole, so that it encodes exactly as
+    it does without this Extension.
     """
 
     text = backend.normalize(line)
     if text.startswith(IM_START):
         return None
 
-    layout, rest = _split_layout(backend, text)
-    segments = _segments(rest) if rest.strip() else []
-    if all(weight == 1.0 for _, weight in segments):
-        return None
+    found = _split_layout(backend, text)
+    if found is None:
+        segments = _segments(text)
+        if all(weight == 1.0 for _, weight in segments):
+            return None
+        return _join(segments)
 
-    return ([(layout, 1.0)] if layout else []) + segments
+    layout, rest = found
+    tail = _join(_segments(rest)) if rest.strip() else []
+    if all(weight == 1.0 for _, weight in (*layout, *tail)):
+        return None
+    if not tail:
+        return layout
+
+    # what comes between the layout and the words after it, as `_join` lays out
+    # the gap between two pieces
+    gap = rest[: len(rest) - len(rest.lstrip())]
+    seam = []
+    newline = max(gap.rfind("\n"), gap.rfind("\r"))
+    if newline >= 0:
+        seam = [(gap[: newline + 1], 1.0)]
+        gap = gap[newline + 1 :]
+    first, weight = tail[0]
+    return [*layout, *seam, (" " + first if gap else first, weight), *tail[1:]]
 
 
 def _join(pieces: list[tuple[str, float]]) -> list[tuple[str, float]]:
@@ -362,15 +558,11 @@ def _join(pieces: list[tuple[str, float]]) -> list[tuple[str, float]]:
 
     Qwen's tokenizer keeps the space before a word inside the word's token, so
     `red` in a sentence is the single token ` red`.  The whitespace between two
-    pieces therefore goes to the front of the second one: the weighted word then
-    tokenizes as it does in the sentence, and its weight lands on that token.  A
-    run of spaces at a seam is a single space, so that `( foo : 0.5 )` weighs
-    `foo` rather than an extra blank.  A line break is a token of its own, and
-    belongs to neither side, so it is kept apart at 1.0.  The ends are
-    stripped, as the engine strips the prompt.
-
-    A single punctuation mark joins the word after it the same way, so that
-    `1girl,(red hair:-1)` is `1girl` and `,red`; the mark goes with the word.
+    pieces therefore goes to the front of the second one, and the weight of the
+    word lands on that token.  A run of spaces at a seam is a single space, so
+    that `( foo : 0.5 )` weighs `foo` rather than an extra blank.  A line break
+    is a token of its own, and belongs to neither side, so it is kept apart at
+    1.0.  The ends are stripped, as the engine strips the prompt.
     """
 
     cores: list[tuple[str, float]] = []
@@ -393,59 +585,110 @@ def _join(pieces: list[tuple[str, float]]) -> list[tuple[str, float]]:
         if newline >= 0:
             joined.append((gap[: newline + 1], 1.0))
             gap = gap[newline + 1 :]
-
-        sentence = "".join(text for text, _ in joined)
-        if (
-            not gap
-            and core[:1].isalpha()
-            and sentence[-2:-1].isalnum()
-            and not sentence[-1].isalnum()
-            and not sentence[-1].isspace()
-        ):
-            last, left = joined.pop()
-            if last[:-1]:
-                joined.append((last[:-1], left))
-            core = last[-1] + core
-
         joined.append((" " + core if gap else core, weight))
 
     return joined
 
 
-def _tokenize(backend, pieces: list[tuple[str, float]]) -> tuple[list[int], list]:
-    """Tokenize the pieces inside a single copy of the template.
+# ================================================================================ #
+# Text Engine
 
-    Each piece is tokenized on its own, so that its tokens are its own by
-    construction, and the template is emitted once around the whole sentence.
+
+def _common(a: list, b: list) -> int:
+    """How many leading tokens `a` and `b` share."""
+
+    count = 0
+    for x, y in zip(a, b):
+        if x != y:
+            break
+        count += 1
+    return count
+
+
+def _sentence(backend, pieces: list[tuple[str, float]]) -> tuple[list[int], list[float]]:
+    """Tokenize the pieces as the one sentence they make, and weigh every token.
+
+    The sentence is tokenized whole, so its tokens are exactly the ones the
+    engine reads for it, whatever the seams between the pieces.  Where each
+    piece starts is found by tokenizing the sentence up to it: up to a seam
+    between two words, that is the sentence's own tokens, cut there.  A token
+    that a seam falls inside belongs to both pieces, and takes whichever of
+    their weights is further from 1.0, so that a weight is never lost to it.
     """
 
-    prefix, _, suffix = backend.template.partition("{}")
+    merged: list[tuple[str, float]] = []
+    for text, weight in pieces:
+        if not text:
+            continue
+        if merged and merged[-1][1] == weight:
+            merged[-1] = (merged[-1][0] + text, weight)
+        else:
+            merged.append((text, weight))
 
-    tokens: list[int] = []
-    weights: list[float] = []
+    if not merged:
+        return [], []
 
-    for text, weight in ((prefix, 1.0), *_join(pieces), (suffix, 1.0)):
-        ids = backend.ids(text) if text else []
-        tokens.extend(ids)
-        weights.extend([weight] * len(ids))
+    sentence = "".join(text for text, _ in merged)
+    tokens = backend.ids(sentence)
+    weights = [merged[0][1]] * len(tokens)
+
+    offset = 0
+    floor = 0
+    for (left, before), (_, after) in zip(merged, merged[1:]):
+        offset += len(left)
+        head = backend.ids(sentence[:offset])
+        cut = max(_common(tokens, head), floor)
+        if cut >= len(tokens):
+            break
+        if cut < len(head):
+            # the seam falls inside token `cut`
+            shared = before if abs(before - 1.0) > abs(after - 1.0) else after
+            weights[cut] = shared
+            weights[cut + 1 :] = [after] * (len(tokens) - cut - 1)
+            floor = cut + 1
+        else:
+            weights[cut:] = [after] * (len(tokens) - cut)
+            floor = cut
+
+    return tokens, weights
+
+
+def _tokenize(backend, pieces: list[tuple[str, float]], images: list) -> tuple[list, list[float], int]:
+    """Tokenize the pieces inside a single copy of the template.
+
+    Returns the tokens, a weight for each, and how many of them come after the
+    last picture, which the text encoder expands into the many embeddings each
+    picture stands for.  The template is emitted once around the whole
+    sentence, as the engine emits it.
+    """
+
+    _, _, suffix = backend.template.partition("{}")
+    head = backend.head(images)
+    text, weights = _sentence(backend, pieces)
+    tail = backend.ids(suffix) if suffix else []
+
+    tokens = [*head, *text, *tail]
+    weights = [*([1.0] * len(head)), *weights, *([1.0] * len(tail))]
 
     if backend.max_length is not None:
         # the engine truncates its own stream, so the weights are cut with it
         tokens = tokens[: backend.max_length]
         weights = weights[: backend.max_length]
 
-    return tokens, weights
+    pictures = [i for i, token in enumerate(tokens) if isinstance(token, dict)]
+    after = len(tokens) - (pictures[-1] + 1 if pictures else 0)
+    return tokens, weights, after
 
 
-def _encode_line(backend, line: str, ignore: bool):
+def _encode_line(backend, line: str, images: list, ignore: bool):
     """One prompt line -> `(conditioning, mask, parsed)`, the tokens first."""
 
     pieces = _parse(backend, line)
     if pieces is None:
-        z = backend.encode_plain(line)
+        z = backend.encode_plain(line, images)
         return z, z.new_ones(z.shape[0], 1), False
 
-    tokens, weights = _tokenize(backend, pieces)
+    tokens, weights, after = _tokenize(backend, pieces, images)
     if ignore:
         # "Ignore" parses the weights and declines to apply them, which leaves
         # NegPiP the sign, as on every other model
@@ -454,15 +697,100 @@ def _encode_line(backend, line: str, ignore: bool):
     pairs = [[(token, 1.0) for token in tokens]]
     z = backend.engine.text_encoder.encode_token_weights(pairs)[0][0]
 
-    # a silent misplacement is the very failure this module exists to avoid
-    if z.shape[0] != len(tokens):
+    # a silent misplacement is the very failure this module exists to avoid;
+    # every weight sits after the pictures, which the encoder expands into
+    # embeddings of their own, so with pictures the mask is aligned from the end
+    if after == len(tokens):
+        aligned = z.shape[0] == len(tokens)
+    else:
+        aligned = z.shape[0] >= after
+    if not aligned:
         raise RuntimeError("NegPiP could not align MOSS-Image's prompt weights")
 
-    mask = torch.tensor(weights, device=z.device, dtype=z.dtype).reshape(-1, 1)
+    mask = z.new_ones(z.shape[0], 1)
+    if after:
+        mask[z.shape[0] - after :, 0] = torch.tensor(
+            weights[len(weights) - after :], device=z.device, dtype=z.dtype
+        )
     return z, mask, True
 
 
-def _hook_get_learned_conditioning(model, backend, remove: bool):
+def _hook_engine(engine, remove: bool):
+    """Patch the text engine class, as `__call__` bypasses the instance."""
+
+    if remove:
+        for name, original in _engine_originals.items():
+            if _state.engine_cls is not None:
+                current = getattr(_state.engine_cls, name, None)
+                if getattr(current, "_negpip_moss", False):
+                    setattr(_state.engine_cls, name, original)
+        _engine_originals.clear()
+        _state.engine_cls = None
+        return
+
+    engine_cls = type(engine)
+    if getattr(engine_cls.__call__, "_negpip_moss", False):
+        # its original is gone with whatever installed it, and calling into
+        # this hook from itself would never return
+        raise RuntimeError("NegPiP is already hooked into MOSS-Image's text engine")
+    _state.engine_cls = engine_cls
+    _engine_originals["__call__"] = engine_cls.__call__
+    engine_cls.__call__ = _negpip_call
+
+
+def _negpip_call(self, texts: list[str], images: list = []):
+    """Encode every prompt as the engine does, keeping a mask of its weights."""
+
+    original = _engine_originals["__call__"]
+    backend = _state.backend
+    collecting = _state.masks
+
+    if collecting is None or backend is None or self is not backend.engine:
+        # not a conditioning NegPiP is collecting
+        return original(self, texts, images) if images else original(self, texts)
+
+    name = emphasis.get_current_option(shared.opts.emphasis).name
+    if name == "None":
+        # which reads a weight as literal characters, exactly as the engine does
+        zs = original(self, texts, images) if images else original(self, texts)
+        collecting.extend(z.new_ones(z.shape[0], 1) for z in zs)
+        return zs
+
+    # as the engine records it, for prompts this Extension leaves alone
+    if any(emphasis.uses_emphasis(text) for text in texts):
+        dynamic_args.last_extra_generation_params["Emphasis"] = "None"
+
+    zs, masks = [], []
+    cache: dict[str, tuple[torch.Tensor, torch.Tensor, bool]] = {}
+    parsed = False
+
+    for line in texts:
+        if line not in cache:
+            cache[line] = _encode_line(backend, line, list(images), name == "Ignore")
+        z, mask, read = cache[line]
+        zs.append(z)
+        masks.append(mask)
+        parsed = parsed or read
+
+    if parsed:
+        # the engine records "None", which is not what was applied
+        dynamic_args.last_extra_generation_params["Emphasis"] = name
+
+    collecting.extend(masks)
+    return zs
+
+
+_negpip_call._negpip_moss = True
+
+
+def _hook_get_learned_conditioning(model, remove: bool):
+    """Collect the masks of the conditioning the model encodes.
+
+    The model's own method stays in charge: it is what hands the pictures of an
+    edit to the engine and the transformer, and what clears them again when
+    there are none, so that an edit cannot leak into the next generation.
+    """
+
     if remove:
         original = getattr(model, "negpip_moss_orig_get_learned_conditioning", None)
         if original is not None:
@@ -480,26 +808,18 @@ def _hook_get_learned_conditioning(model, backend, remove: bool):
     @torch.inference_mode()
     @wraps(original)
     def get_learned_conditioning(prompt):
-        memory_management.load_model_gpu(model.forge_objects.clip.patcher)
-
-        name = emphasis.get_current_option(shared.opts.emphasis).name
+        _state.masks = []
         _state.reported = False
+        try:
+            conds = original(prompt)
+            masks = _state.masks
+        finally:
+            _state.masks = None
 
-        contexts, masks = [], []
-        cache: dict[str, tuple[torch.Tensor, torch.Tensor, bool]] = {}
-        parsed = False
-
-        for line in prompt:
-            if line not in cache:
-                cache[line] = _encode_line(backend, line, name == "Ignore")
-            z, mask, read = cache[line]
-            contexts.append(z)
-            masks.append(mask)
-            parsed = parsed or read
-
-        if parsed:
-            # the engine records "None", which is not what was applied
-            dynamic_args.last_extra_generation_params["Emphasis"] = name
+        # Keep this deliberately strict: silently losing the mask is worse than
+        # exposing an upstream conditioning API change.
+        if not isinstance(conds, list) or len(masks) != len(conds):
+            raise RuntimeError("NegPiP could not align MOSS-Image's prompt weights")
 
         negated = sum(int((mask < 0.0).sum()) for mask in masks)
         weighted = sum(int(((mask >= 0.0) & (mask != 1.0)).sum()) for mask in masks)
@@ -514,8 +834,8 @@ def _hook_get_learned_conditioning(model, backend, remove: bool):
             counts += [f"{weighted} weighted"] if weighted else []
             print(f"NegPiP Enable ({key}: {', '.join(counts)})")
 
-        # lists, so that prompts of different lengths are padded downstream
-        return {"crossattn": contexts, MASK_KEY: masks}
+        # lists, so that prompts of different lengths are batched apart downstream
+        return {"crossattn": conds, MASK_KEY: masks}
 
     get_learned_conditioning._negpip_moss = True
     model.get_learned_conditioning = get_learned_conditioning
@@ -530,10 +850,9 @@ def _hook_compile_conditions(remove: bool):
 
     It knows a bare tensor, or a dict with both `crossattn` and a pooled
     `vector`, which MOSS-Image has none of.  The mask rides as the conditioning
-    itself rides, a `ConditionCrossAttn`: when the positive and negative prompts
-    differ in length, Forge batches them by repeating the shorter one along the
-    tokens, and the mask is repeated with them, which keeps every row of it on
-    its own token and the batching exactly what it is without this Extension.
+    itself rides, a `ConditionCrossAttn`, so that it is batched exactly as the
+    conditioning is: together when the prompts are the same length, apart when
+    they are not, each row of it staying on its own token.
     """
 
     if remove:
@@ -608,21 +927,25 @@ def _probe_attention(dit):
         raise RuntimeError("NegPiP could not find Forge's attention override")
 
 
-def _hook_dit_forward(dit, remove: bool):
+def _hook_dit(dit, remove: bool):
     """Patch the transformer class rather than the instance we were handed.
 
     `forge_objects` is rebuilt from `forge_objects_after_applying_lora` before
     every sampling, so the class is what reliably runs.  The mask arrives as a
     keyword of the forward, which both transformers would otherwise discard,
     and is turned into the attention override of that one call.
+
+    The extension computes the keys and values of its reference pictures from
+    inside the forward, with the same options, so that branch is fenced off:
+    it never sees the prompt, and what it computes is kept for every step.
     """
 
     if remove:
         cls = _state.dit_cls
-        original = _dit_originals.pop("forward", None)
-        if cls is not None and original is not None:
-            if getattr(cls.forward, "_negpip_moss", False):
-                cls.forward = original
+        for name, original in _dit_originals.items():
+            if cls is not None and getattr(getattr(cls, name, None), "_negpip_moss", False):
+                setattr(cls, name, original)
+        _dit_originals.clear()
         _state.dit_cls = None
         return
 
@@ -637,7 +960,10 @@ def _hook_dit_forward(dit, remove: bool):
         if mask is None:
             return original(self, *args, **kwargs)
 
+        x = args[0] if args else kwargs.get("x", None)
         context = kwargs.get("context", args[2] if len(args) > 2 else None)
+        if not torch.is_tensor(x) or x.ndim != 4:
+            raise RuntimeError("MOSS-Image NegPiP could not find the image tokens")
         if torch.is_tensor(context) and context.shape[1] != mask.shape[1]:
             raise RuntimeError("MOSS-Image NegPiP mask does not match the prompt")
 
@@ -649,12 +975,29 @@ def _hook_dit_forward(dit, remove: bool):
             options = dict(kwargs.get("transformer_options", None) or {})
             kwargs["transformer_options"] = options
 
+        # both transformers embed every latent pixel as a token, ahead of the prompt
+        image = x.shape[-2] * x.shape[-1]
         previous = options.get(OVERRIDE_KEY, None)
-        options[OVERRIDE_KEY] = _attention_override(mask, previous)
+        options[OVERRIDE_KEY] = _attention_override(mask, image, previous)
         return original(self, *args, **kwargs)
 
     forward._negpip_moss = True
     cls.forward = forward
+
+    if callable(getattr(cls, "reference_kv", None)):
+        reference_original = cls.reference_kv
+        _dit_originals["reference_kv"] = reference_original
+
+        @wraps(reference_original)
+        def reference_kv(self, *args, **kwargs):
+            _state.references += 1
+            try:
+                return reference_original(self, *args, **kwargs)
+            finally:
+                _state.references -= 1
+
+        reference_kv._negpip_moss = True
+        cls.reference_kv = reference_kv
 
 
 def _text_mask(mask) -> Optional[torch.Tensor]:
@@ -674,7 +1017,7 @@ def _text_mask(mask) -> Optional[torch.Tensor]:
     return mask
 
 
-def _attention_override(mask: torch.Tensor, previous: Optional[Callable]):
+def _attention_override(mask: torch.Tensor, image: int, previous: Optional[Callable]):
     """The attention override that weighs the values of the weighted words.
 
     An override already installed by someone else is chained, so that both
@@ -686,9 +1029,14 @@ def _attention_override(mask: torch.Tensor, previous: Optional[Callable]):
     def override(func, *args, **kwargs):
         attend = func if previous is None else partial(previous, func)
 
-        if len(args) >= 4 and torch.is_tensor(args[2]):
+        if (
+            not _state.references
+            and len(args) >= 4
+            and torch.is_tensor(args[0])
+            and torch.is_tensor(args[2])
+        ):
             heads_first = bool(kwargs.get("skip_reshape", False))
-            values = _weigh_values(args[2], mask, heads_first)
+            values = _weigh_values(args[0], args[2], mask, image, heads_first)
             if values is not None:
                 args = (*args[:2], values, *args[3:])
 
@@ -698,13 +1046,19 @@ def _attention_override(mask: torch.Tensor, previous: Optional[Callable]):
 
 
 def _weigh_values(
-    v: torch.Tensor, mask: torch.Tensor, heads_first: bool
+    q: torch.Tensor,
+    v: torch.Tensor,
+    mask: torch.Tensor,
+    image: int,
+    heads_first: bool,
 ) -> Optional[torch.Tensor]:
     """Scale the values of the weighted text tokens about the prompt's mean.
 
-    The text trails the image in the joint stream of both transformers, so the
-    last tokens of the stream are the prompt, one for one with the mask.  A
-    stream no longer than the prompt is a text refiner, which is left alone.
+    The prompt follows the image tokens in the joint stream of both
+    transformers, one for one with the mask.  Whatever an edit adds comes after
+    it: the pictures as tokens of their own, or their keys and values, joined to
+    the prompt's.  A stream that holds less than the image and the prompt is a
+    text refiner, which is left alone.
 
     The mean is taken over the tokens the mask leaves alone, so that a weighted
     word cannot drag its own reference towards itself.  Everything is decided
@@ -713,11 +1067,12 @@ def _weigh_values(
     """
 
     axis = 2 if heads_first else 1
-    if v.ndim != axis + 2:
+    if v.ndim != axis + 2 or q.ndim != axis + 2:
         return None
 
     length, text = v.shape[axis], mask.shape[1]
-    if length <= text:
+    end = image + text
+    if length < end or q.shape[axis] < end:
         return None
 
     m = mask
@@ -729,8 +1084,7 @@ def _weigh_values(
     if heads_first:
         m = m.unsqueeze(1)
 
-    start = length - text
-    values = v.narrow(axis, start, text).float()
+    values = v.narrow(axis, image, text).float()
     keep = (m == 1.0).float()
     mean = (values * keep).sum(dim=axis, keepdim=True)
     mean = mean / keep.sum(dim=axis, keepdim=True).clamp_min(1.0)
@@ -746,4 +1100,7 @@ def _weigh_values(
             f"of {text} text tokens, {length} in the stream)"
         )
 
-    return torch.cat((v.narrow(axis, 0, start), weighted), dim=axis)
+    parts = [v.narrow(axis, 0, image), weighted]
+    if length > end:
+        parts.append(v.narrow(axis, end, length - end))
+    return torch.cat(parts, dim=axis)
