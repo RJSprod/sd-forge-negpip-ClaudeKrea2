@@ -13,7 +13,7 @@ This is an Extension for Forge [Classic](https://github.com/Haoming02/sd-webui-f
 - add `(bar:-1.0)` in the `negative prompt` to **enforce** a concept
 
 > [!NOTE]
-> **Krea 2** normally reads prompt weights as literal text, so `(foo:-1.0)` would spell out the very concept it was meant to remove. While this Extension is active, the weights are honored, in **Edit** mode too, meaning that regular emphasis *(eg. `(foo:1.5)`)* takes effect as well.
+> **Krea 2** reads prompt weights as literal text, so `(foo:-1.0)` would spell out the very concept it was meant to remove, and `(foo:1.5)` would ask for `foo` with the brackets on. As soon as a prompt carries a weight, negative or not, this Extension reads it instead, in **Edit** mode too, meaning that regular emphasis *(eg. `(foo:1.5)`)* takes effect as well.
 
 > [!TIP]
 > On **Krea 2** the weight is a dial, not a switch. A single-stream transformer also attends over the reference and image streams, so one text token carries far less of the attention than it does in **SD**, and `-1.0` can be too subtle to see. Turn it up *(eg. `(foo:-3.0)`)* until the concept goes.
@@ -51,7 +51,7 @@ The Extension reports what it did, so that nothing it decided is silent:
 | --- | --- |
 | `NegPiP Loaded` | it is installed and being called, listing the models it can handle |
 | `NegPiP Active` | it engaged, naming the model it recognised |
-| `NegPiP Enable` | how many tokens it is negating *(and on **MOSS-Image**, weighting)* |
+| `NegPiP Enable` | how many tokens it is negating *(and on **Krea 2** and **MOSS-Image**, weighting)* |
 | `NegPiP Applied` | *(Krea 2, MOSS-Image)* the weights reached the transformer |
 | `NegPiP Disabled` | it stood down, and why |
 
