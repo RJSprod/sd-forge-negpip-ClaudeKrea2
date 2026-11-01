@@ -3,7 +3,7 @@ This is an Extension for Forge [Classic](https://github.com/Haoming02/sd-webui-f
 
 > [!IMPORTANT]
 > Supports **SD1**, **SDXL**, **Anima**, **Krea 2**, and **MOSS-Image** on Forge Neo.
-> **Krea 2** is supported in **txt2img**, **img2img**, as well as **Edit** *(reference)* mode.
+> **Krea 2** and **MOSS-Image** are supported in **txt2img**, **img2img**, as well as **Edit** *(reference)* mode.
 > **Anima** and **Krea 2** need a Forge Neo from 2026-10-01 or later, after its text engines were rewritten.
 > **MOSS-Image** is supported through Forge Neo's own support, as well as the [moss-image-forge-neo](https://github.com/eduardoabreu81/moss-image-forge-neo) Extension.
 
@@ -32,8 +32,13 @@ This is an Extension for Forge [Classic](https://github.com/Haoming02/sd-webui-f
 
 The weight scales what the word contributes to the image, measured from the average of the prompt's other words: `0.5` is half of what makes it that word, `2.0` twice, and `-1.0` its opposite. The prompt itself is encoded exactly as it would be without the weights, and it works on every attention backend, at no noticeable cost in speed.
 
+It works in **Edit** mode as well, on both backends: the reference pictures are set up by the model as always, and only the prompt is weighted, never the pictures.
+
 > [!NOTE]
-> A layout prompt *(the JSON the **JSON Builder** writes)* is handed to the model untouched, brackets and all. Only what follows it, such as the Builder's **Extra** field, is read for weights.
+> A layout prompt *(the JSON that [Regional Boxes](https://github.com/eduardoabreu81/sd-regional-boxes-neo) or the **JSON Builder** writes)* is handed to the model as it is, except for its captions: the scene's `caption` and every item's are read for weights, so `(red sofa:-1.0)` in a caption works as it does in any prompt. The words to render (`text`), the `meta` and the boxes are data, and stay exactly as written. What follows the layout, such as the Builder's **Extra** field, is read as usual.
+
+> [!TIP]
+> The **JSON Builder** escapes every parenthesis it writes, so a weight typed into one of its caption fields stays literal text. Put it in **Extra** instead, or in a caption of a layout written another way.
 
 > [!TIP]
 > As everywhere else in Forge, a prompt with a weight reads its parentheses as emphasis, so write `\(` and `\)` for literal ones. `BREAK` stays an ordinary word. The `Ignore` **Emphasis Mode** keeps only the negative weights, and `None` turns this off, as on **Krea 2**.
