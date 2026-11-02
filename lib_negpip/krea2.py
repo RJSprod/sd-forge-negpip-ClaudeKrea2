@@ -10,12 +10,17 @@ language model a negated embedding, which stands for no word at all.  Sign
 flipping that output cannot recover the concept, which is why negative weights
 read as doing nothing here however they were masked afterwards.  The word is
 therefore encoded at its magnitude, so the conditioning stays a faithful
-representation of it, and the sign is carried separately as a mask that
-negates the value projection of those tokens in every single-stream block.
-Attention still routes to the concept, and the image stream subtracts it
-instead of adding it, which is what NegPiP is.  The SD implementation has the
-same shape: it encodes the negated concept with a positive weight for exactly
-this reason.
+representation of it, and the weight itself is carried separately as a mask
+that scales the value projection of those tokens in every single-stream
+block.  Attention still routes to the concept, and the image stream subtracts
+it instead of adding it, which is what NegPiP is.  The SD implementation has
+the same shape: it encodes the negated concept with a positive weight for
+exactly this reason.
+
+A positive weight goes the same way.  Emphasis on the input embeddings is all
+but lost on Qwen3-VL, which normalises every hidden state before reading it,
+so `(foo:1.5)` there alone changes next to nothing; it is scaling the value
+projection that makes the word count for more, or for less.
 
 The text engine, a port of ComfyUI's since Forge Neo rewrote them all, does
 not weight the prompt at all.  It tokenizes the templated prompt with weights
@@ -81,10 +86,7 @@ class _EngineState:
     """^ the same weights per prompt, expanded over the embeddings of every image"""
 
     masks: list[torch.Tensor] = None
-    """sign masks of the last engine call, one per prompt"""
-
-    weighted: int = 0
-    """how many tokens of the last engine call a positive weight emphasized"""
+    """value masks of the last engine call, one per prompt"""
 
     dit_cls: type = None
     """the patched transformer class"""
@@ -100,7 +102,6 @@ class _EngineState:
         self.pending = None
         self.aligned = None
         self.masks = None
-        self.weighted = 0
         self.hooked = set()
         self.reported = False
 
@@ -270,15 +271,13 @@ def _negpip_call(self, texts: list[str], images: list[torch.Tensor] = []):
     option = emphasis.get_current_option(shared.opts.emphasis)()
     emphasized = any(emphasis.uses_emphasis(x) for x in texts)
 
-    # "None" reads a weight as literal characters, so there is no region to
-    # negate, and the engine is left to encode the prompt exactly as it would.
-    # Every other mode parses them, and the sign is all NegPiP needs: the
-    # magnitude only decides how strongly the concept is emphasized first.
+    # "None" reads a weight as literal characters, so there is nothing to
+    # weigh, and the engine is left to encode the prompt exactly as it would.
     if isinstance(option, emphasis.EmphasisNone):
         if emphasized:
             print(f'NegPiP Disabled (Emphasis: "{option.name}")')
         zs = _originals["__call__"](self, texts, images)
-        _state.masks = [_sign_mask(None, z) for z in zs]
+        _state.masks = [_value_mask(None, z, False) for z in zs]
         return zs
 
     _state.emphasis = option
@@ -295,21 +294,16 @@ def _negpip_call(self, texts: list[str], images: list[torch.Tensor] = []):
     if emphasized:
         dynamic_args.last_extra_generation_params["Emphasis"] = option.name
 
+    ignore = isinstance(option, emphasis.EmphasisIgnore)
     masks: list[torch.Tensor] = []
-    weighted = 0
     for line, z in zip(texts, zs):
         weights = aligned.get(line, None)
         # a silent no-op is the very failure this module exists to avoid
         if weights is None:
             raise RuntimeError("NegPiP could not align Krea 2's emphasis weights")
-        masks.append(_sign_mask(weights, z))
-        if not isinstance(option, emphasis.EmphasisIgnore):
-            # the prompt is the tail the template was stripped from, see `_sign_mask`
-            prompt = weights[-z.shape[0] :] if len(weights) >= z.shape[0] else []
-            weighted += sum(1 for w in prompt if w >= 0.0 and w != 1.0)
+        masks.append(_value_mask(weights, z, ignore))
 
     _state.masks = masks
-    _state.weighted = weighted
     return zs
 
 
@@ -406,8 +400,8 @@ def _hook_process_tokens(encoder, remove: bool):
         _state.aligned[line] = aligned
 
         # the emphasis is handed the magnitudes: scaling an input embedding by
-        # a negative weight encodes as no word at all, so the sign is left to
-        # the mask and applied to the value projection instead
+        # a negative weight encodes as no word at all, so the weight itself,
+        # sign and all, is left to the mask and applied to the value projection
         magnitudes = torch.tensor(
             [[abs(weight) for weight in aligned]],
             device=embeds.device,
@@ -457,14 +451,21 @@ def _align_multipliers(
     return weights if len(weights) == length else None
 
 
-def _sign_mask(weights: Optional[list[float]], z: torch.Tensor) -> torch.Tensor:
+def _value_mask(
+    weights: Optional[list[float]], z: torch.Tensor, ignore: bool
+) -> torch.Tensor:
     """Build the value mask of a prompt, aligned with its conditioning.
 
-    Negated tokens keep their weight rather than collapsing to -1, so it is a
-    dial rather than a switch.  It needs to be: a single-stream transformer
-    attends over the reference and image streams as well, so a text token is a
-    far smaller share of the attention than it is in the cross attention of SD,
-    and `-1.0` alone is easily too little to see.  Everything else stays at 1.
+    Every weighted token keeps its weight, so that it is a dial rather than a
+    switch, either way: `(foo:2.0)` doubles what the word adds to the image,
+    `(foo:0.5)` halves it, and `(foo:-1.0)` subtracts it instead.  It needs to
+    be a dial: a single-stream transformer attends over the reference and image
+    streams as well, so a text token is a far smaller share of the attention
+    than it is in the cross attention of SD, and `-1.0` alone is easily too
+    little to see.  Everything else stays at 1.
+
+    "Ignore" declines to apply emphasis, which leaves NegPiP the negative
+    weights only, as on every other model.
     """
 
     length = z.shape[0]
@@ -476,7 +477,9 @@ def _sign_mask(weights: Optional[list[float]], z: torch.Tensor) -> torch.Tensor:
     # the template of the first region was stripped off the front
     values = torch.as_tensor(weights[-length:], device=z.device, dtype=z.dtype)
     values = values.reshape(length, 1, 1)
-    return torch.where(values < 0.0, values, ones)
+    if ignore:
+        return torch.where(values < 0.0, values, ones)
+    return values
 
 
 # ================================================================================ #
@@ -499,11 +502,9 @@ def _hook_get_learned_conditioning(model, remove: bool):
     @wraps(original)
     def get_learned_conditioning(prompt):
         _state.masks = None
-        _state.weighted = 0
         _state.reported = False
         conds = original(prompt)
         masks, _state.masks = _state.masks, None
-        weighted, _state.weighted = _state.weighted, 0
 
         # Krea 2 returns one [tokens, layers, features] tensor per prompt.
         # Keep this deliberately strict: silently losing the mask is worse than
@@ -514,27 +515,28 @@ def _hook_get_learned_conditioning(model, remove: bool):
             raise RuntimeError("Unexpected Krea 2 conditioning masks")
 
         contexts, negpip_masks = [], []
-        count = 0
+        negated = weighted = 0
 
         for cond, mask in zip(conds, masks):
             if not isinstance(cond, torch.Tensor):
                 raise RuntimeError("Unexpected Krea 2 conditioning item")
 
             mask = mask.to(cond)
-            count += int((mask < 0).sum())
+            negated += int((mask < 0).sum())
+            weighted += int(((mask >= 0) & (mask != 1)).sum())
             # the conditioning is left alone: it is what the text fusion
             # transformer reads, and the concept has to survive it intact for
-            # attention to route to the tokens the mask then subtracts
+            # attention to route to the tokens the mask then weighs
             contexts.append(cond)
             negpip_masks.append(mask)
 
-        if count or weighted:
+        if negated or weighted:
             key = (
                 "Negative"
                 if getattr(prompt, "is_negative_prompt", False)
                 else "Positive"
             )
-            counts = [f"{count} negated"] if count else []
+            counts = [f"{negated} negated"] if negated else []
             counts += [f"{weighted} weighted"] if weighted else []
             print(f"NegPiP Enable ({key}: {', '.join(counts)})")
 
@@ -632,7 +634,7 @@ def _attention_mask(mask: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
     batch, tokens = mask.shape[0], mask.shape[1]
     if mask.numel() != batch * tokens:
         return None
-    if not bool((mask < 0).any()):
+    if not bool((mask != 1).any()):
         return None
 
     return mask.reshape(batch, tokens, 1)
@@ -699,10 +701,13 @@ def _hook_value_projections(dit, remove: bool):
 
             if not _state.reported:
                 _state.reported = True
-                negated = int((mask[:, :text_length] < 0).sum())
+                prompt = mask[:, :text_length]
+                negated = int((prompt < 0).sum())
+                weighted = int(((prompt >= 0) & (prompt != 1)).sum())
                 print(
-                    f"NegPiP Applied (Krea 2: {negated} of {text_length} text "
-                    f"tokens, {values.shape[1]} in the stream)"
+                    f"NegPiP Applied (Krea 2: {negated} negated, {weighted} "
+                    f"weighted of {text_length} text tokens, {values.shape[1]} "
+                    "in the stream)"
                 )
 
             return values
