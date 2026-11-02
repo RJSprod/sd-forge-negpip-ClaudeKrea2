@@ -16,7 +16,7 @@ This is an Extension for Forge [Classic](https://github.com/Haoming02/sd-webui-f
 > **Krea 2** reads prompt weights as literal text, so `(foo:-1.0)` would spell out the very concept it was meant to remove, and `(foo:1.5)` would ask for `foo` with the brackets on. As soon as a prompt carries a weight, negative or not, this Extension reads it instead, in **Edit** mode too, meaning that regular emphasis *(eg. `(foo:1.5)`)* takes effect as well.
 
 > [!TIP]
-> On **Krea 2** the weight is a dial, not a switch. A single-stream transformer also attends over the reference and image streams, so one text token carries far less of the attention than it does in **SD**, and `-1.0` can be too subtle to see. Turn it up *(eg. `(foo:-3.0)`)* until the concept goes.
+> On **Krea 2** the weight is a dial, not a switch, either way: it scales what the word adds to the image, so `(foo:2.0)` doubles it, `(foo:0.5)` halves it, and `(foo:-1.0)` subtracts it instead. A single-stream transformer also attends over the reference and image streams, so one text token carries far less of the attention than it does in **SD**, and `1.5` or `-1.0` can be too subtle to see. Turn it up *(eg. `(foo:3.0)` or `(foo:-3.0)`)* until it shows.
 
 > [!TIP]
 > **Krea 2** does not work with the `None` **Emphasis Mode**, which reads a weight as literal characters rather than parsing it. The console says so when that happens; every other mode is fine.
